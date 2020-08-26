@@ -43,7 +43,7 @@ class MultiSessionsGraph(InMemoryDataset):
             x = []
             for node in sequence:
                 if node not in nodes:
-                    nodes[node] = i  # 轉成新的 id
+                    nodes[node] = i  # node第一次出現的位置
                     x.append([node])  # 同一sequence下的unique node
                     i += 1
                 senders.append(nodes[node])  # 為了建 out A
@@ -57,7 +57,7 @@ class MultiSessionsGraph(InMemoryDataset):
             # senders, receivers = senders + receivers, receivers + senders
 
             # padding sequence
-            sequence_len = torch.tensor([len(sequence)], dtype=torch.long)
+            sequence_len = torch.tensor([len(sequence)], dtype=torch.long)  # 原始sequence長度
             mask = [1] * len(sequence) + padding_item * (len_max - len(sequence))
             sequence = sequence + padding_item * (len_max - len(sequence))
 

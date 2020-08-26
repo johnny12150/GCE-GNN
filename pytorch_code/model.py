@@ -60,7 +60,7 @@ class GNN(Module):
         return hy
 
     def forward(self, A, hidden, edge_index=None):
-        # todo 原始 paper用 GAT取代 GGNN
+        # 原始 paper用 GAT取代 GGNN
         # hidden = F.relu(self.conv1(hidden, edge_index))
         # hidden = self.conv2(hidden, edge_index)
 
@@ -160,6 +160,8 @@ def forward(model, i, data):
     hidden = torch.split(hidden, tuple(sections))
     x = torch.split(items, tuple(sections))
     # x是unique nodes, sequence是原始序列
+    # todo 測試不padding直接算attention的版本
+
     alias_inputs = []
     for i in range(targets.shape[0]):
         x_ = x[i].cpu().numpy().reshape(-1)
@@ -167,7 +169,6 @@ def forward(model, i, data):
         seq_ = seq[i, :len_]
         alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
 
-    # get = lambda i: hidden[i][alias_inputs[i]]
     leng = seq.shape[1]
     seq_hidden = torch.stack([get(pad, i, hidden, alias_inputs, leng) for i in torch.arange(len(alias_inputs)).long()])
     return targets, model.compute_scores(seq_hidden, mask)
@@ -178,9 +179,7 @@ def train_test(model, train, test):
     print('start training: ', datetime.datetime.now())
     model.train()
     total_loss = 0.0
-    # slices = train_data.generate_batch(model.batch_size)
     for i, batch in enumerate(train):
-    # for i, j in zip(slices, np.arange(len(slices))):
         model.optimizer.zero_grad()
         targets, scores = forward(model, i, batch.to('cuda'))
         # targets = trans_to_cuda(torch.Tensor(targets).long())
@@ -195,18 +194,20 @@ def train_test(model, train, test):
     print('start predicting: ', datetime.datetime.now())
     model.eval()
     hit, mrr = [], []
-    # slices = test_data.generate_batch(model.batch_size)
-    # for i in slices:
     for i, batch in enumerate(test):
         targets, scores = forward(model, i, batch.to('cuda'))
+        targets -= 1
         sub_scores = scores.topk(20)[1]
         sub_scores = trans_to_cpu(sub_scores).detach().numpy()
-        for score, target, mask in zip(sub_scores, targets.cpu(), batch.sequence_mask):
-            hit.append(np.isin(target - 1, score))
-            if len(np.where(score == target - 1)[0]) == 0:
+        targets = targets.cpu().numpy()  # target & score must both be numpy arrays
+        for score, target in zip(sub_scores, targets):
+            hit.append(np.isin(target, score))
+            if not np.isin(target, score):
+            # if len(np.where(score == target)[0]) == 0:
                 mrr.append(0)
             else:
-                mrr.append(1 / (np.where(score == target - 1)[0][0] + 1))
+                # at_where = np.where(score == target)
+                mrr.append(1 / (np.where(score == target)[0][0] + 1))
     hit = np.mean(hit) * 100
     mrr = np.mean(mrr) * 100
     return hit, mrr
