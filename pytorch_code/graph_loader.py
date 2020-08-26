@@ -57,8 +57,9 @@ class MultiSessionsGraph(InMemoryDataset):
             # senders, receivers = senders + receivers, receivers + senders
 
             # padding sequence
-            sequence = sequence + padding_item * (len_max - len(sequence))
+            sequence_len = torch.tensor([len(sequence)], dtype=torch.long)
             mask = [1] * len(sequence) + padding_item * (len_max - len(sequence))
+            sequence = sequence + padding_item * (len_max - len(sequence))
 
             pair = {}  # 紀錄item間的edge
             sur_senders = senders[:]
@@ -88,7 +89,6 @@ class MultiSessionsGraph(InMemoryDataset):
             y = torch.tensor([y], dtype=torch.long)
             # custom args
             sequence = torch.tensor(sequence, dtype=torch.long)
-            sequence_len = torch.tensor([len(sequence)], dtype=torch.long)
             mask = torch.tensor(mask, dtype=torch.long)
             # 相當於networkx的graph
             session_graph = Data(x=x, y=y,
