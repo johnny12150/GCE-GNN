@@ -37,9 +37,9 @@ class GNN(Module):
         self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
 
-        self.conv1 = GATConv(self.hidden_size, self.hidden_size, heads=8, dropout=0.6)
+        self.conv1 = GATConv(self.hidden_size, self.hidden_size, heads=1, dropout=0.6)
         # On the Pubmed dataset, use heads=8 in conv2.
-        self.conv2 = GATConv(8 * 100, self.hidden_size, heads=1, concat=False, dropout=0.6)
+        self.conv2 = GATConv(8 * self.hidden_size, self.hidden_size, heads=1, concat=False, dropout=0.6)
         self.ggnn = GatedGraphConv(self.hidden_size, step+1)
 
     def GNNCell(self, A, hidden, edge_index):
@@ -61,11 +61,12 @@ class GNN(Module):
 
     def forward(self, A, hidden, edge_index=None):
         # 原始 paper用 GAT取代 GGNN
-        # hidden = F.relu(self.conv1(hidden, edge_index))
+        hidden = F.relu(self.conv1(hidden, edge_index))
         # hidden = self.conv2(hidden, edge_index)
 
         # todo 用 GGNN layer
-        hidden = self.ggnn(hidden, edge_index)
+        # hidden = F.relu(hidden)
+        hidden = F.relu(self.ggnn(hidden, edge_index))
 
         # for i in range(self.step):
         #     hidden = self.GNNCell(A, hidden, edge_index)
@@ -85,6 +86,7 @@ class SessionGraph(Module):
         self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
         self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
+        self.gru = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, dropout=0, batch_first=True)
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
@@ -96,6 +98,7 @@ class SessionGraph(Module):
             weight.data.uniform_(-stdv, stdv)
 
     def compute_scores(self, hidden, mask):
+        hidden, _ = self.gru(hidden)
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
         q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
         q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
@@ -160,7 +163,6 @@ def forward(model, i, data):
     hidden = torch.split(hidden, tuple(sections))
     x = torch.split(items, tuple(sections))
     # x是unique nodes, sequence是原始序列
-    # todo 測試不padding直接算attention的版本
 
     alias_inputs = []
     for i in range(targets.shape[0]):
@@ -182,7 +184,6 @@ def train_test(model, train, test):
     for i, batch in enumerate(train):
         model.optimizer.zero_grad()
         targets, scores = forward(model, i, batch.to('cuda'))
-        # targets = trans_to_cuda(torch.Tensor(targets).long())
         loss = model.loss_function(scores, targets - 1)
         loss.backward()
         model.optimizer.step()

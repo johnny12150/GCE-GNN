@@ -33,7 +33,7 @@ class MultiSessionsGraph(InMemoryDataset):
         # 找最長的 sequence
         us_lens = [len(upois) for upois in data[0]]
         len_max = max(us_lens)
-        padding_item = [0]
+        padding_item = [0]  # fixme 可能不能用 0 padding, 要用 max item id +1
 
         for sequence, y in zip(data[0], data[1]):
             # sequence = [1, 3, 2, 2, 1, 3, 4]
