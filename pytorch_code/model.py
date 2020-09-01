@@ -98,11 +98,11 @@ class GlobalGraph(Module):
             else:
                 # 只有 1-hop的情況
                 edge_index, size = adjs[j].edge_index, adjs[j].size
-                # x = self.gat(x_all[j], edge_index)  # 加gat, 目前套件不支援
-                # sage
                 x = x_all[j]
                 if len(list(x.shape)) < 2:
                     x = x.unsqueeze(0)  # add one more dim to wrap the embedding
+                x = self.gat(x, edge_index)  # 加gat
+                # sage
                 x_target = x[:size[1]]  # Target nodes are always placed first.
                 x = self.convs[-1]((x, x_target), edge_index)
             xs.append(x)
@@ -159,19 +159,18 @@ class SessionGraph(Module):
         b_size = 1  # 不分batch, 所以全部都是1
         for i, gs in enumerate(g_samplers):  # 從g_samplers每個sampler取adjs
             for (b_size, node_idx, adjs) in gs:
-                # todo global graph的 item emb要獨立?
                 g_adjs.append(adjs.to('cuda'))
-                n_idxs.append(node_idx.numpy()[0])  # 過完global拿到的shape會和放進去的一樣
-                s_nodes.append(self.embedding(node_idx.cuda()).squeeze())
+                n_idxs.append(node_idx[0])  # 過完global拿到的shape會和放進去的一樣
+                s_nodes.append(self.embedding(node_idx.cuda()).squeeze())  # todo global graph的 item emb要獨立?
         g_hidden = self.global_g(s_nodes, g_adjs)  # nodes轉成embedding丟進global graph
         # g__ = g_hidden.cpu().detach().numpy()  # same node_idx會拿到一樣的g_hidden
         # 從inputs的id取g_hidden的emb
-        n_idxs = np.array(n_idxs)
-        inputs = inputs.cpu().numpy()
+        n_idxs = torch.tensor(np.array(n_idxs)).cuda()
         indices = []
         # 建所有對照的位置, 最後一次tensor select
         for i in inputs:
-            indices.append(np.where(n_idxs==i)[0][0])  # 紀錄第一個出現的位置
+            # indices.append(np.where(n_idxs==i)[0][0])  # 紀錄第一個出現的位置
+            indices.append((n_idxs==i).nonzero(as_tuple=False)[0][0])  # 紀錄第一個出現的位置
         indices = torch.tensor(indices).cuda()
         g_h = torch.index_select(g_hidden, 0, indices)
         hidden += g_h
@@ -216,6 +215,7 @@ def forward(model, i, data):
     # A = [nx.convert_matrix.to_pandas_adjacency(g).values for g in graphs]  # 無向圖adj = in + out
     # A_out = [g for g in graphs]  # 有向圖的adj就是A_out
 
+    # todo 解決train很慢 & ram用量會越來越高的問題
     # global graph
     subgraph_loaders = []
     # 從大graph中找session graph內的node id的鄰居
@@ -235,11 +235,11 @@ def forward(model, i, data):
     # x是unique nodes, sequence是原始序列
 
     alias_inputs = []
+    # todo 直接在 tensor上做來加速
     seq = seq.cpu().numpy()
     seq_len = seq_len.cpu().numpy()
     for i in range(targets.shape[0]):
         x_ = x[i].cpu().numpy().reshape(-1)
-        # todo 改成用mask再reshape更快
         len_ = seq_len[i]
         seq_ = seq[i, :len_]  # 取不是padding的部分
         alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
@@ -263,6 +263,7 @@ def train_test(model, train, test):
         total_loss += loss
         if i % int(len(train) / 5 + 1) == 0:
             print('[%d/%d] Loss: %.4f' % (i, len(train), loss.item()))
+    # todo 增加寫 log的功能
     print('\tLoss:\t%.3f' % total_loss)
 
     print('start predicting: ', datetime.datetime.now())
