@@ -8,7 +8,9 @@ Created on July, 2018
 
 import argparse
 import pickle
+import logging
 import time
+from datetime import datetime as dt
 from utils import build_graph, Data, split_validation
 from model import *
 import os
@@ -31,6 +33,12 @@ parser.add_argument('--validation', action='store_true', help='validation')
 parser.add_argument('--valid_portion', type=float, default=0.1, help='split the portion of training set as validation set')
 opt = parser.parse_args()
 print(opt)
+
+today = dt.today()
+log_file = os.getcwd()+'/log/'+opt.dataset+'_%s_%s_%s.log' % (str(today.year), str(today.month), str(today.day))
+FORMAT = '%(asctime)s %(levelname)s: %(message)s'
+datefmt = '%m/%d/%Y %H:%M:%S'
+logging.basicConfig(level=logging.INFO, filename=log_file, format=FORMAT, datefmt=datefmt, filemode='w')
 
 
 def main():
@@ -56,8 +64,10 @@ def main():
     for epoch in range(opt.epoch):
         print('-------------------------------------------------------')
         print('epoch: ', epoch)
+        logging.info('-------------------------------------------------------')
+        logging.info('epoch: %s', epoch)
         # hit, mrr = train_test(model, train_data, test_data)
-        hit, mrr = train_test(model, train_loader, test_loader)
+        hit, mrr = train_test(model, train_loader, test_loader, logging)
         flag = 0
         if hit >= best_result[0]:
             best_result[0] = hit
@@ -69,12 +79,16 @@ def main():
             flag = 1
         print('Best Result:')
         print('\tRecall@20:\t%.4f\tMMR@20:\t%.4f\tEpoch:\t%d,\t%d'% (best_result[0], best_result[1], best_epoch[0], best_epoch[1]))
+        logging.info('Best Result:')
+        logging.info('\tRecall@20:\t%.4f\tMMR@20:\t%.4f\tEpoch:\t%d,\t%d'% (best_result[0], best_result[1], best_epoch[0], best_epoch[1]))
         bad_counter += 1 - flag
         if bad_counter >= opt.patience:
             break
     print('-------------------------------------------------------')
     end = time.time()
     print("Run time: %f s" % (end - start))
+    logging.info('-------------------------------------------------------')
+    logging.info("Run time: %f s" % (end - start))
 
 
 if __name__ == '__main__':
