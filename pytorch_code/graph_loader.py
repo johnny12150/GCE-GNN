@@ -33,7 +33,13 @@ class MultiSessionsGraph(InMemoryDataset):
         # 找最長的 sequence
         us_lens = [len(upois) for upois in data[0]]
         len_max = max(us_lens)
-        padding_item = [0]  # fixme 可能不能用 0 padding, 要用 max item id +1
+        us_id = [max(upois) for upois in data[0]]
+        id_max = max(us_id)
+        id_min = min(us_id)
+        if id_min == 0:
+            padding_item = [id_max+1]
+        else:
+            padding_item = [0]
 
         for sequence, y in zip(data[0], data[1]):
             # sequence = [1, 3, 2, 2, 1, 3, 4]
@@ -83,7 +89,7 @@ class MultiSessionsGraph(InMemoryDataset):
             # 計算node間的pattern次數, edge的初始weight
             edge_attr = torch.tensor([pair[str(senders[i]) + '-' + str(receivers[i])] for i in range(len(senders))],
                                      dtype=torch.float)
-
+            # source node到 destination node, node id在這是有被re-index
             edge_index = torch.tensor([senders, receivers], dtype=torch.long)
             x = torch.tensor(x, dtype=torch.long)  # 保留原始的node id
             y = torch.tensor([y], dtype=torch.long)

@@ -1,10 +1,5 @@
 #!/usr/bin/env python36
 # -*- coding: utf-8 -*-
-"""
-Created on July, 2018
-
-@author: Tangrizzly
-"""
 
 import datetime
 import math
@@ -14,13 +9,14 @@ from torch import nn
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, GatedGraphConv, SAGEConv
+from torch_geometric.data import NeighborSampler
 from torch_geometric.utils import to_networkx
 from torch_cluster import random_walk
 import networkx as nx
 
 
 class GNN(Module):
-    def __init__(self, hidden_size, step=1):
+    def __init__(self, hidden_size, opt, n_node, step=1):
         super(GNN, self).__init__()
         self.step = step
         self.hidden_size = hidden_size
@@ -37,15 +33,13 @@ class GNN(Module):
         self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
 
-        self.conv1 = GATConv(self.hidden_size, self.hidden_size, heads=1, dropout=0.6)
+        heads = 1
+        self.conv1 = GATConv(self.hidden_size, self.hidden_size, heads=heads, dropout=0.6)
         # On the Pubmed dataset, use heads=8 in conv2.
-        self.conv2 = GATConv(8 * self.hidden_size, self.hidden_size, heads=1, concat=False, dropout=0.6)
+        self.conv2 = GATConv(heads * self.hidden_size, self.hidden_size, heads=1, concat=False, dropout=0.6)
         self.ggnn = GatedGraphConv(self.hidden_size, step+1)
 
     def GNNCell(self, A, hidden, edge_index):
-        # todo 加上公式 8, 9的 GAT
-        hy = self.conv1(hidden, edge_index)
-
         input_in = torch.matmul(A[:, :, :A.shape[1]], self.linear_edge_in(hidden)) + self.b_iah
         input_out = torch.matmul(A[:, :, A.shape[1]: 2 * A.shape[1]], self.linear_edge_out(hidden)) + self.b_oah
         inputs = torch.cat([input_in, input_out], 2)
@@ -59,12 +53,12 @@ class GNN(Module):
         hy = newgate + inputgate * (hidden - newgate)
         return hy
 
-    def forward(self, A, hidden, edge_index=None):
+    def forward(self, A, hidden, edge_index):
         # 原始 paper用 GAT取代 GGNN
         hidden = F.relu(self.conv1(hidden, edge_index))
         # hidden = self.conv2(hidden, edge_index)
 
-        # todo 用 GGNN layer
+        # GGNN layer
         # hidden = F.relu(hidden)
         hidden = F.relu(self.ggnn(hidden, edge_index))
 
@@ -73,20 +67,64 @@ class GNN(Module):
         return hidden
 
 
+class GlobalGraph(Module):
+    def __init__(self, opt, n_node):
+        super(GlobalGraph, self).__init__()
+        self.hidden_size = opt.hiddenSize
+        in_channels = hidden_channels = self.hidden_size
+        self.num_layers = 1  # todo 之後改成 2-hop
+        heads = 1
+        # todo 暫時用GAT
+        self.gat = GATConv(self.hidden_size, self.hidden_size, heads=heads, dropout=0.3)
+        self.convs = nn.ModuleList()
+        # todo Aggregation/ MessagePassing, 暫時用graphsage (mean)
+        self.convs.append(SAGEConv(in_channels, hidden_channels, normalize=True))
+        for i in range(self.num_layers -1):
+            self.convs.append(SAGEConv(hidden_channels, hidden_channels, normalize=True))
+
+    def forward(self, x, adjs):
+        xs = []
+        x_all = x
+        # 每個session graph分別過gat, sage
+        for j in range(len(adjs)):
+            if self.num_layers > 1:
+                for i, (edge_index, _, size) in enumerate(adjs[j]):
+                    x = self.gat(x_all[j])  # 加gat
+                    # sage
+                    x_target = x[:size[1]]  # Target nodes are always placed first.
+                    x = self.convs[i]((x, x_target), edge_index)
+                    if i != self.num_layers - 1:
+                        x = F.relu(x)  # 最後一曾不用relu
+            else:
+                # 只有 1-hop的情況
+                edge_index, size = adjs[j].edge_index, adjs[j].size
+                # x = self.gat(x_all[j], edge_index)  # 加gat, 目前套件不支援
+                # sage
+                x = x_all[j]
+                if len(list(x.shape)) < 2:
+                    x = x.unsqueeze(0)  # add one more dim to wrap the embedding
+                x_target = x[:size[1]]  # Target nodes are always placed first.
+                x = self.convs[-1]((x, x_target), edge_index)
+            xs.append(x)
+        return torch.cat(xs, 0)
+
+
 class SessionGraph(Module):
     def __init__(self, opt, n_node):
         super(SessionGraph, self).__init__()
         self.hidden_size = opt.hiddenSize
+        self.global_data = torch.load('./datasets/'+opt.dataset+'/global_graph.pt')
         self.n_node = n_node
         self.batch_size = opt.batchSize
         self.nonhybrid = opt.nonhybrid
         self.embedding = nn.Embedding(self.n_node, self.hidden_size)
-        self.gnn = GNN(self.hidden_size, step=opt.step)
+        self.gnn = GNN(self.hidden_size, opt, n_node, step=opt.step)
         self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
         self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
         self.gru = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, dropout=0, batch_first=True)
+        self.global_g = GlobalGraph(opt, n_node)
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
@@ -97,7 +135,7 @@ class SessionGraph(Module):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def compute_scores(self, hidden, mask):
+    def compute_scores(self, hidden, mask, use_mask=True):
         hidden, _ = self.gru(hidden)
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
         q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
@@ -110,9 +148,33 @@ class SessionGraph(Module):
         scores = torch.matmul(a, b.transpose(1, 0))
         return scores
 
-    def forward(self, inputs, A, edge_index=None):
-        hidden = self.embedding(inputs).squeeze()
+    def forward(self, inputs, A, edge_index=None, g_samplers=None):
+        hidden = self.embedding(inputs).squeeze()  # 把node id轉成embedding
         hidden = self.gnn(A, hidden, edge_index)
+
+        # call global graph
+        g_adjs = []
+        n_idxs = []
+        s_nodes = []  # 每個session內node的embedding
+        b_size = 1  # 不分batch, 所以全部都是1
+        for i, gs in enumerate(g_samplers):  # 從g_samplers每個sampler取adjs
+            for (b_size, node_idx, adjs) in gs:
+                # todo global graph的 item emb要獨立?
+                g_adjs.append(adjs.to('cuda'))
+                n_idxs.append(node_idx.numpy()[0])  # 過完global拿到的shape會和放進去的一樣
+                s_nodes.append(self.embedding(node_idx.cuda()).squeeze())
+        g_hidden = self.global_g(s_nodes, g_adjs)  # nodes轉成embedding丟進global graph
+        # g__ = g_hidden.cpu().detach().numpy()  # same node_idx會拿到一樣的g_hidden
+        # 從inputs的id取g_hidden的emb
+        n_idxs = np.array(n_idxs)
+        inputs = inputs.cpu().numpy()
+        indices = []
+        # 建所有對照的位置, 最後一次tensor select
+        for i in inputs:
+            indices.append(np.where(n_idxs==i)[0][0])  # 紀錄第一個出現的位置
+        indices = torch.tensor(indices).cuda()
+        g_h = torch.index_select(g_hidden, 0, indices)
+        hidden += g_h
         pad = self.embedding(torch.Tensor([0]).to(torch.int64).cuda())
         return hidden, pad
 
@@ -144,34 +206,45 @@ def get(padding_emb, i, hidden, alias_inputs, length):
 def forward(model, i, data):
     # 改成用 geometric的Data格式
     items, targets, mask, batch, seq = data.x, data.y, data.sequence_mask, data.batch, data.sequence
-    seq = seq.view(targets.shape[0], -1).cpu().numpy()
-    seq_len = data.sequence_len.view(-1).cpu().numpy()
+    seq = seq.view(targets.shape[0], -1)
+    seq_len = data.sequence_len
     mask = mask.view(targets.shape[0], -1)
 
     A = []
     # datas = data.to_data_list()
     # graphs = [to_networkx(d) for d in datas]
     # A = [nx.convert_matrix.to_pandas_adjacency(g).values for g in graphs]  # 無向圖adj = in + out
-    # # todo 用原始seq建 in& out adj
     # A_out = [g for g in graphs]  # 有向圖的adj就是A_out
-    # # todo 從 adj, in_edge建 in adj
 
-    hidden, pad = model(items, A, data.edge_index)
+    # global graph
+    subgraph_loaders = []
+    # 從大graph中找session graph內的node id的鄰居
+    gg = model.global_data
+    gg_edge_index = gg.edge_index
+    for i in range(targets.shape[0]):
+        session_nodes = seq[i, :seq_len[i]]
+        subgraph_loaders.append(NeighborSampler(gg_edge_index, node_idx=session_nodes, sizes=[-1], shuffle=False, num_workers=0))
+
+    hidden, pad = model(items, A, data.edge_index, subgraph_loaders)  # session graph node embeddings
     # 推回原始序列
     sections = torch.bincount(batch).cpu().numpy()
     # split whole x back into graphs G_i
     hidden = torch.split(hidden, tuple(sections))
+    # todo 增加不考慮padding的選項
     x = torch.split(items, tuple(sections))
     # x是unique nodes, sequence是原始序列
 
     alias_inputs = []
+    seq = seq.cpu().numpy()
+    seq_len = seq_len.cpu().numpy()
     for i in range(targets.shape[0]):
         x_ = x[i].cpu().numpy().reshape(-1)
+        # todo 改成用mask再reshape更快
         len_ = seq_len[i]
-        seq_ = seq[i, :len_]
+        seq_ = seq[i, :len_]  # 取不是padding的部分
         alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
 
-    leng = seq.shape[1]
+    leng = mask.shape[1]
     seq_hidden = torch.stack([get(pad, i, hidden, alias_inputs, leng) for i in torch.arange(len(alias_inputs)).long()])
     return targets, model.compute_scores(seq_hidden, mask)
 
