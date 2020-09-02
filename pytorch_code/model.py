@@ -13,6 +13,7 @@ from torch_geometric.data import NeighborSampler
 from torch_geometric.utils import to_networkx
 from torch_cluster import random_walk
 import networkx as nx
+from tqdm import tqdm
 
 
 class GNN(Module):
@@ -85,27 +86,26 @@ class GlobalGraph(Module):
     def forward(self, x, adjs):
         xs = []
         x_all = x
-        # 每個session graph分別過gat, sage
-        for j in range(len(adjs)):
-            if self.num_layers > 1:
-                for i, (edge_index, _, size) in enumerate(adjs[j]):
-                    x = self.gat(x_all[j])  # 加gat
-                    # sage
-                    x_target = x[:size[1]]  # Target nodes are always placed first.
-                    x = self.convs[i]((x, x_target), edge_index)
-                    if i != self.num_layers - 1:
-                        x = F.relu(x)  # 最後一曾不用relu
-            else:
-                # 只有 1-hop的情況
-                edge_index, size = adjs[j].edge_index, adjs[j].size
-                x = x_all[j]
-                if len(list(x.shape)) < 2:
-                    x = x.unsqueeze(0)  # add one more dim to wrap the embedding
-                x = self.gat(x, edge_index)  # 加gat
+        # 每個session graph分別過gat, sage, todo 拔最外層for, 一次找全部node emb
+        # for j in range(len(adjs)):
+        if self.num_layers > 1:
+            for i, (edge_index, _, size) in enumerate(adjs):
+                x = self.gat(x_all)  # 加gat
                 # sage
                 x_target = x[:size[1]]  # Target nodes are always placed first.
-                x = self.convs[-1]((x, x_target), edge_index)
-            xs.append(x)
+                x = self.convs[i]((x, x_target), edge_index)
+                if i != self.num_layers - 1:
+                    x = F.relu(x)  # 最後一曾不用relu
+        else:
+            # 只有 1-hop的情況
+            edge_index, size = adjs.edge_index, adjs.size
+            x = x_all
+            if len(list(x.shape)) < 2:
+                x = x.unsqueeze(0)  # add one more dim to wrap the embedding
+            x = self.gat(x, edge_index)  # 加gat
+            x_target = x[:size[1]]  # Target nodes are always placed first.
+            x = self.convs[-1]((x, x_target), edge_index)  # sage
+        xs.append(x)
         return torch.cat(xs, 0)
 
 
@@ -135,35 +135,41 @@ class SessionGraph(Module):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def compute_scores(self, hidden, mask, use_mask=True):
-        hidden, _ = self.gru(hidden)
-        ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
-        q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
-        q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
-        alpha = self.linear_three(torch.sigmoid(q1 + q2))
-        a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
-        if not self.nonhybrid:
-            a = self.linear_transform(torch.cat([a, ht], 1))
-        b = self.embedding.weight[1:]  # n_nodes x latent_size
-        scores = torch.matmul(a, b.transpose(1, 0))
+    def compute_scores(self, hidden, mask=None, use_mask=True):
+        if use_mask:
+            hidden, _ = self.gru(hidden)
+            ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
+            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
+            q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
+            alpha = self.linear_three(torch.sigmoid(q1 + q2))
+            a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
+            if not self.nonhybrid:
+                a = self.linear_transform(torch.cat([a, ht], 1))
+            b = self.embedding.weight[1:]  # n_nodes x latent_size
+            scores = torch.matmul(a, b.transpose(1, 0))
         return scores
 
     def forward(self, inputs, A, edge_index=None, g_samplers=None):
         hidden = self.embedding(inputs).squeeze()  # 把node id轉成embedding
-        hidden = self.gnn(A, hidden, edge_index)
+        hidden = self.gnn(A, hidden, edge_index)  # session graph
 
         # call global graph
         g_adjs = []
         n_idxs = []
         s_nodes = []  # 每個session內node的embedding
-        b_size = 1  # 不分batch, 所以全部都是1
-        for i, gs in enumerate(g_samplers):  # 從g_samplers每個sampler取adjs
-            for (b_size, node_idx, adjs) in gs:
-                g_adjs.append(adjs.to('cuda'))
-                n_idxs.append(node_idx[0])  # 過完global拿到的shape會和放進去的一樣
-                s_nodes.append(self.embedding(node_idx.cuda()).squeeze())  # todo global graph的 item emb要獨立?
+        # todo 少掉最外層的 for
+        # for i, gs in enumerate(g_samplers):  # 從g_samplers每個sampler取adjs
+            # for (b_size, node_idx, adjs) in g_samplers:
+            #     g_adjs.append(adjs.to('cuda'))
+            #     n_idxs.append(node_idx[0])  # 過完global拿到的shape會和放進去的一樣
+            #     s_nodes.append(self.embedding(node_idx.cuda()).squeeze())
+        for (b_size, node_idx, adjs) in g_samplers:
+            g_adjs = adjs.to('cuda')
+            n_idxs = node_idx  # 過完global拿到的shape會和放進去的一樣
+            s_nodes = self.embedding(node_idx.cuda()).squeeze()  # todo global graph的 item emb要獨立?
         g_hidden = self.global_g(s_nodes, g_adjs)  # nodes轉成embedding丟進global graph
         # g__ = g_hidden.cpu().detach().numpy()  # same node_idx會拿到一樣的g_hidden
+
         # 從inputs的id取g_hidden的emb
         n_idxs = torch.tensor(np.array(n_idxs)).cuda()
         indices = []
@@ -198,6 +204,7 @@ def get(padding_emb, i, hidden, alias_inputs, length):
     if h_.shape[0] == length:
         return h_
     else:
+        # todo 用 torch加速
         r_ = padding_emb.repeat(length - h_.shape[0], 1)
         return torch.cat([h_, r_])
 
@@ -215,56 +222,68 @@ def forward(model, i, data):
     # A = [nx.convert_matrix.to_pandas_adjacency(g).values for g in graphs]  # 無向圖adj = in + out
     # A_out = [g for g in graphs]  # 有向圖的adj就是A_out
 
-    # todo 解決train很慢 & ram用量會越來越高的問題
+    # todo 解決cpu, ram用量會越來越高的問題
     # global graph
-    subgraph_loaders = []
+    # subgraph_loaders = []
     # 從大graph中找session graph內的node id的鄰居
     gg = model.global_data
     gg_edge_index = gg.edge_index
-    for i in range(targets.shape[0]):
-        session_nodes = seq[i, :seq_len[i]]
-        subgraph_loaders.append(NeighborSampler(gg_edge_index, node_idx=session_nodes, sizes=[-1], shuffle=False, num_workers=0))
+    # fixme 直接改成對 batch下所有node做NeighborSample
+    # for i in range(targets.shape[0]):
+        # session_nodes = seq[i, :seq_len[i]]  # Tensor
+        # subgraph_loaders.append(NeighborSampler(gg_edge_index, node_idx=session_nodes, sizes=[-1], shuffle=False, num_workers=0))
+    batch_nodes = seq.flatten()
+    batch_nodes = torch.unique(batch_nodes)
+    batch_nodes = batch_nodes[batch_nodes!=0]  # 移除padding node id
+    # sample as whole batch
+    subgraph_loaders = NeighborSampler(gg_edge_index, node_idx=batch_nodes, sizes=[-1], shuffle=False, num_workers=0, batch_size=batch_nodes.shape[0])
 
     hidden, pad = model(items, A, data.edge_index, subgraph_loaders)  # session graph node embeddings
     # 推回原始序列
     sections = torch.bincount(batch).cpu().numpy()
     # split whole x back into graphs G_i
     hidden = torch.split(hidden, tuple(sections))
-    # todo 增加不考慮padding的選項
-    x = torch.split(items, tuple(sections))
-    # x是unique nodes, sequence是原始序列
 
-    alias_inputs = []
-    # todo 直接在 tensor上做來加速
-    seq = seq.cpu().numpy()
-    seq_len = seq_len.cpu().numpy()
-    for i in range(targets.shape[0]):
-        x_ = x[i].cpu().numpy().reshape(-1)
-        len_ = seq_len[i]
-        seq_ = seq[i, :len_]  # 取不是padding的部分
-        alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
+    mask_true = True
+    if mask_true:
+        # todo 增加不考慮padding的選項
+        x = torch.split(items, tuple(sections))
+        # x是unique nodes, sequence是原始序列
+        alias_inputs = []
+        # todo 直接在 tensor上做來加速 or 在前處理做好
+        seq = seq.cpu().numpy()
+        seq_len = seq_len.cpu().numpy()
+        for i in range(targets.shape[0]):
+            x_ = x[i].cpu().numpy().reshape(-1)
+            len_ = seq_len[i]
+            seq_ = seq[i, :len_]  # 取不是padding的部分
+            alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
 
-    leng = mask.shape[1]
-    seq_hidden = torch.stack([get(pad, i, hidden, alias_inputs, leng) for i in torch.arange(len(alias_inputs)).long()])
-    return targets, model.compute_scores(seq_hidden, mask)
+        leng = mask.shape[1]
+        seq_hidden = torch.stack([get(pad, i, hidden, alias_inputs, leng) for i in torch.arange(len(alias_inputs)).long()])
+    else:
+        seq_hidden = hidden
+    return targets, model.compute_scores(seq_hidden, mask, mask_true)
 
 
-def train_test(model, train, test):
+def train_test(model, train, test, logging):
     model.scheduler.step()
     print('start training: ', datetime.datetime.now())
     model.train()
     total_loss = 0.0
-    for i, batch in enumerate(train):
+    for i, batch in tqdm(enumerate(train)):
         model.optimizer.zero_grad()
         targets, scores = forward(model, i, batch.to('cuda'))
         loss = model.loss_function(scores, targets - 1)
         loss.backward()
         model.optimizer.step()
         total_loss += loss
+        # 控制總共要印幾次loss
         if i % int(len(train) / 5 + 1) == 0:
             print('[%d/%d] Loss: %.4f' % (i, len(train), loss.item()))
-    # todo 增加寫 log的功能
+            logging.info('[%d/%d] Loss: %.4f' % (i, len(train), loss.item()))
     print('\tLoss:\t%.3f' % total_loss)
+    logging.info('\tLoss:\t%.3f' % total_loss)
 
     print('start predicting: ', datetime.datetime.now())
     model.eval()
