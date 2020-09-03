@@ -86,8 +86,7 @@ class GlobalGraph(Module):
     def forward(self, x, adjs):
         xs = []
         x_all = x
-        # 每個session graph分別過gat, sage, todo 拔最外層for, 一次找全部node emb
-        # for j in range(len(adjs)):
+        # 每個session graph分別過gat, sage
         if self.num_layers > 1:
             for i, (edge_index, _, size) in enumerate(adjs):
                 x = self.gat(x_all)  # 加gat
@@ -113,7 +112,7 @@ class SessionGraph(Module):
     def __init__(self, opt, n_node):
         super(SessionGraph, self).__init__()
         self.hidden_size = opt.hiddenSize
-        self.global_data = torch.load('./datasets/'+opt.dataset+'/global_graph.pt')
+        self.global_data = torch.load('./datasets/'+opt.dataset+'/global_graph_start0.pt')
         self.n_node = n_node
         self.batch_size = opt.batchSize
         self.nonhybrid = opt.nonhybrid
@@ -157,25 +156,18 @@ class SessionGraph(Module):
         g_adjs = []
         n_idxs = []
         s_nodes = []  # 每個session內node的embedding
-        # todo 少掉最外層的 for
-        # for i, gs in enumerate(g_samplers):  # 從g_samplers每個sampler取adjs
-            # for (b_size, node_idx, adjs) in g_samplers:
-            #     g_adjs.append(adjs.to('cuda'))
-            #     n_idxs.append(node_idx[0])  # 過完global拿到的shape會和放進去的一樣
-            #     s_nodes.append(self.embedding(node_idx.cuda()).squeeze())
+        # fixme 在server上edge_index有可能超過e_id的問題
         for (b_size, node_idx, adjs) in g_samplers:
             g_adjs = adjs.to('cuda')
-            n_idxs = node_idx  # 過完global拿到的shape會和放進去的一樣
+            n_idxs = node_idx.cuda()  # 過完global拿到的shape會和放進去的一樣
             s_nodes = self.embedding(node_idx.cuda()).squeeze()  # todo global graph的 item emb要獨立?
         g_hidden = self.global_g(s_nodes, g_adjs)  # nodes轉成embedding丟進global graph
         # g__ = g_hidden.cpu().detach().numpy()  # same node_idx會拿到一樣的g_hidden
 
         # 從inputs的id取g_hidden的emb
-        n_idxs = torch.tensor(np.array(n_idxs)).cuda()
         indices = []
         # 建所有對照的位置, 最後一次tensor select
         for i in inputs:
-            # indices.append(np.where(n_idxs==i)[0][0])  # 紀錄第一個出現的位置
             indices.append((n_idxs==i).nonzero(as_tuple=False)[0][0])  # 紀錄第一個出現的位置
         indices = torch.tensor(indices).cuda()
         g_h = torch.index_select(g_hidden, 0, indices)
@@ -199,6 +191,8 @@ def trans_to_cpu(variable):
 
 
 def get(padding_emb, i, hidden, alias_inputs, length):
+    # if torch.any(alias_inputs[i] > hidden[i].shape[0]):
+    #     print(torch.any(alias_inputs[i] > hidden[i].shape[0]))
     # 手動padding
     h_ = hidden[i][alias_inputs[i]]
     if h_.shape[0] == length:
@@ -213,7 +207,7 @@ def forward(model, i, data):
     # 改成用 geometric的Data格式
     items, targets, mask, batch, seq = data.x, data.y, data.sequence_mask, data.batch, data.sequence
     seq = seq.view(targets.shape[0], -1)
-    seq_len = data.sequence_len
+    # seq_len = data.sequence_len
     mask = mask.view(targets.shape[0], -1)
 
     A = []
@@ -222,20 +216,15 @@ def forward(model, i, data):
     # A = [nx.convert_matrix.to_pandas_adjacency(g).values for g in graphs]  # 無向圖adj = in + out
     # A_out = [g for g in graphs]  # 有向圖的adj就是A_out
 
-    # todo 解決cpu, ram用量會越來越高的問題
+    # todo 解決cpu usage高的問題
     # global graph
-    # subgraph_loaders = []
-    # 從大graph中找session graph內的node id的鄰居
     gg = model.global_data
     gg_edge_index = gg.edge_index
-    # fixme 直接改成對 batch下所有node做NeighborSample
-    # for i in range(targets.shape[0]):
-        # session_nodes = seq[i, :seq_len[i]]  # Tensor
-        # subgraph_loaders.append(NeighborSampler(gg_edge_index, node_idx=session_nodes, sizes=[-1], shuffle=False, num_workers=0))
+    # 直接對 batch下所有node做NeighborSample
     batch_nodes = seq.flatten()
     batch_nodes = torch.unique(batch_nodes)
     batch_nodes = batch_nodes[batch_nodes!=0]  # 移除padding node id
-    # sample as whole batch
+    # sample as whole batch, 從大graph中找session graph內的node id的鄰居
     subgraph_loaders = NeighborSampler(gg_edge_index, node_idx=batch_nodes, sizes=[-1], shuffle=False, num_workers=0, batch_size=batch_nodes.shape[0])
 
     hidden, pad = model(items, A, data.edge_index, subgraph_loaders)  # session graph node embeddings
@@ -244,22 +233,30 @@ def forward(model, i, data):
     # split whole x back into graphs G_i
     hidden = torch.split(hidden, tuple(sections))
 
+    # todo 增加不考慮padding的選項
     mask_true = True
     if mask_true:
-        # todo 增加不考慮padding的選項
-        x = torch.split(items, tuple(sections))
-        # x是unique nodes, sequence是原始序列
-        alias_inputs = []
         # todo 直接在 tensor上做來加速 or 在前處理做好
-        seq = seq.cpu().numpy()
-        seq_len = seq_len.cpu().numpy()
-        for i in range(targets.shape[0]):
-            x_ = x[i].cpu().numpy().reshape(-1)
-            len_ = seq_len[i]
-            seq_ = seq[i, :len_]  # 取不是padding的部分
-            alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
+        # x = torch.split(items, tuple(sections))
+        # # x是unique nodes, sequence是原始序列
+        # alias_inputs = []
+        # seq = seq.cpu().numpy()
+        # seq_len = seq_len.cpu().numpy()
+        # for i in range(targets.shape[0]):
+        #     x_ = x[i].cpu().numpy().reshape(-1)
+        #     len_ = seq_len[i]
+        #     seq_ = seq[i, :len_]  # 取不是padding的部分
+        #     alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
 
         leng = mask.shape[1]
+        alias_inputs = data.alias_inputs
+        s_len = data.sequence_len.cpu().numpy().tolist()
+        alias_inputs = torch.split(alias_inputs, s_len)
+        # alias_inputs2 = data.alias_inputs
+        # alias_inputs2 = torch.split(alias_inputs2, s_len)
+        # alias_inputs2 = [i.cpu().numpy().tolist() for i in list(alias_inputs2)]
+        # compare_ = [alias_inputs[i]==alias_inputs2[i] for i in range(len(alias_inputs))]
+        # print(all([alias_inputs[i]==alias_inputs2[i] for i in range(len(alias_inputs))]))
         seq_hidden = torch.stack([get(pad, i, hidden, alias_inputs, leng) for i in torch.arange(len(alias_inputs)).long()])
     else:
         seq_hidden = hidden

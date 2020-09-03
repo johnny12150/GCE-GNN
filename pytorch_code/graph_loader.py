@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-
+import numpy as np
 import pickle
 import torch
 import collections
@@ -54,6 +54,7 @@ class MultiSessionsGraph(InMemoryDataset):
                     i += 1
                 senders.append(nodes[node])  # 為了建 out A
             receivers = senders[:]
+            alias_inputs = [np.where(np.array(x) == node)[0][0] for node in sequence]  # unique node位置
 
             if len(senders) != 1:
                 del senders[-1]  # the last item is a receiver
@@ -96,11 +97,12 @@ class MultiSessionsGraph(InMemoryDataset):
             # custom args
             sequence = torch.tensor(sequence, dtype=torch.long)
             mask = torch.tensor(mask, dtype=torch.long)
+            alias_inputs = torch.tensor(alias_inputs, dtype=torch.long)
             # 相當於networkx的graph
             session_graph = Data(x=x, y=y,
                                  edge_index=edge_index, edge_attr=edge_attr,
                                  sequence=sequence, sequence_len=sequence_len,
-                                 sequence_mask=mask,
+                                 sequence_mask=mask, alias_inputs=alias_inputs,
                                  out_degree_inv=out_degree_inv, in_degree_inv=in_degree_inv)
             data_list.append(session_graph)
 
