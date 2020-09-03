@@ -6,17 +6,23 @@ import pickle
 from tqdm import tqdm
 import networkx as nx
 import torch
+import os
 
-dataset = 'datasets/sample/'
+# dataset = 'datasets/sample/'
+dataset = 'datasets/diginetica/'
 # Global graph
 with open(dataset+'train.txt', 'rb') as f:
     train = pickle.load(f)
-# unique items in train
-unique_nodes = []
-for i, seq in tqdm(enumerate(train[0])):
-    for j, node in enumerate(seq):
-        if node not in unique_nodes:
-            unique_nodes.append(node)
+if not os.path.exists(dataset+'unique_nodes.pkl'):
+    # unique items in train
+    unique_nodes = []
+    for i, seq in tqdm(enumerate(train[0])):
+        for j, node in enumerate(seq):
+            if node not in unique_nodes:
+                unique_nodes.append(node)
+    pickle.dump(unique_nodes, open(dataset+'unique_nodes.pkl', 'wb'))
+else:
+    unique_nodes = pickle.load(open(dataset+'unique_nodes.pkl', 'rb'))
 # 所有unique item在所有session中曾出現的前後2個item建graph
 # 從所有session中先記錄每個item前後2個item有誰
 graph_node = {k: [] for k in unique_nodes}
@@ -25,10 +31,12 @@ for i, seq in tqdm(enumerate(train[0])):
     if len(seq) > 0:
         for j, node in enumerate(seq):
             # 有考慮self-loop
-            if j+epsilon < len(seq)-1:
-                graph_node[node]+=seq[j:j+epsilon]
+            if j+1+epsilon < len(seq)-1:
+                graph_node[node]+=seq[j+1:j+epsilon]
             else:
                 graph_node[node]+=seq[j:len(seq)]
+for i, k in enumerate(graph_node.keys()):
+    graph_node[k] = list(set(graph_node[k]))
 graph_node = dict(sorted(graph_node.items()))  # sort dict by keys
 
 edge_lists = []
@@ -52,18 +60,10 @@ l = l[l[:, 1].argsort()]
 l = l[l[:, 0].argsort(kind='mergesort')]
 l = l.transpose()
 r = np.array([l[1, :], l[0, :]])  # 建無向圖
-# get node id from edge index
-# x = []
-# for col in r.T:
-#     # 從edge_index中找unique node
-#     if col[0] not in x:
-#         x.append(col[0])
-#     if col[1] not in x:
-#         x.append(col[1])
-# x = torch.tensor(x, dtype=torch.float)
-edge_index = torch.from_numpy(r).long()-1  # node index應該都要從0開始
 
-# todo 全部有 309nodes, 就要給309個feature
+edge_index = torch.from_numpy(r).long()
+# edge_index = torch.from_numpy(r).long()-1  # node index應該都要從0開始
+
 x = torch.arange(1, l[0].max()+1).long()
 data = Data(x, edge_index)  # 假設x是從node id 0 開始遞增
 d = data.edge_index.data.numpy()
@@ -76,7 +76,7 @@ data3 = from_networkx(G)
 data3.x = torch.tensor(list(G.nodes)).unsqueeze(-1)  # 不一定對的上, 因為node id可能早被重新編碼
 
 # 很費時, 建好graph就直接存檔(networkx(用Data直接轉) + Data)
-torch.save(data, dataset + 'global_graph.pt')
+torch.save(data, dataset + 'global_graph_start0.pt')
 
 
 # 如果是dynamic版的話:
