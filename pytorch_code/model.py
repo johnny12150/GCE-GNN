@@ -10,9 +10,7 @@ from torch.nn import Module, Parameter
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, GatedGraphConv, SAGEConv
 from torch_geometric.data import NeighborSampler
-from torch_geometric.utils import to_networkx
 from torch_cluster import random_walk
-import networkx as nx
 from tqdm import tqdm
 
 
@@ -73,7 +71,7 @@ class GlobalGraph(Module):
         super(GlobalGraph, self).__init__()
         self.hidden_size = opt.hiddenSize
         in_channels = hidden_channels = self.hidden_size
-        self.num_layers = 1  # todo 之後改成 2-hop
+        self.num_layers = 2
         heads = 1
         # todo 暫時用GAT
         self.gat = GATConv(self.hidden_size, self.hidden_size, heads=heads, dropout=0.3)
@@ -89,7 +87,10 @@ class GlobalGraph(Module):
         # 每個session graph分別過gat, sage
         if self.num_layers > 1:
             for i, (edge_index, _, size) in enumerate(adjs):
-                x = self.gat(x_all)  # 加gat
+                x = x_all
+                if len(list(x.shape)) < 2:
+                    x = x.unsqueeze(0)  # add one more dim to wrap the embedding
+                x = self.gat(x, edge_index)  # 加gat
                 # sage
                 x_target = x[:size[1]]  # Target nodes are always placed first.
                 x = self.convs[i]((x, x_target), edge_index)
@@ -117,6 +118,7 @@ class SessionGraph(Module):
         self.batch_size = opt.batchSize
         self.nonhybrid = opt.nonhybrid
         self.embedding = nn.Embedding(self.n_node, self.hidden_size)
+        self.embedding2 = nn.Embedding(self.n_node, self.hidden_size)
         self.gnn = GNN(self.hidden_size, opt, n_node, step=opt.step)
         self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
@@ -138,17 +140,19 @@ class SessionGraph(Module):
         if use_mask:
             hidden, _ = self.gru(hidden)
             ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
+            # todo 可以加 TAGNN的想法
             q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
             q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
             alpha = self.linear_three(torch.sigmoid(q1 + q2))
             a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
             if not self.nonhybrid:
                 a = self.linear_transform(torch.cat([a, ht], 1))
+            # todo 改用 node embedding
             b = self.embedding.weight[1:]  # n_nodes x latent_size
             scores = torch.matmul(a, b.transpose(1, 0))
         return scores
 
-    def forward(self, inputs, A, edge_index=None, g_samplers=None):
+    def forward(self, inputs, A, edge_index=None, g_samplers=None, unique=False):
         hidden = self.embedding(inputs).squeeze()  # 把node id轉成embedding
         hidden = self.gnn(A, hidden, edge_index)  # session graph
 
@@ -156,24 +160,30 @@ class SessionGraph(Module):
         g_adjs = []
         n_idxs = []
         s_nodes = []  # 每個session內node的embedding
-        # fixme 在server上edge_index有可能超過e_id的問題
         for (b_size, node_idx, adjs) in g_samplers:
-            g_adjs = adjs.to('cuda')
+            if type(adjs) == list:  # 2-hop
+                g_adjs = [adj.to('cuda') for adj in adjs]
+            else:
+                g_adjs = adjs.to('cuda')
             n_idxs = node_idx.cuda()  # 過完global拿到的shape會和放進去的一樣
-            s_nodes = self.embedding(node_idx.cuda()).squeeze()  # todo global graph的 item emb要獨立?
+            # s_nodes = self.embedding2(n_idxs).squeeze()  # global graph的 item emb獨立效果也差不多
+            s_nodes = self.embedding(n_idxs).squeeze()  # global graph的 item emb獨立效果也差不多
+
         g_hidden = self.global_g(s_nodes, g_adjs)  # nodes轉成embedding丟進global graph
         # g__ = g_hidden.cpu().detach().numpy()  # same node_idx會拿到一樣的g_hidden
 
-        # 從inputs的id取g_hidden的emb
-        indices = []
-        # 建所有對照的位置, 最後一次tensor select
-        for i in inputs:
-            indices.append((n_idxs==i).nonzero(as_tuple=False)[0][0])  # 紀錄第一個出現的位置
-        indices = torch.tensor(indices).cuda()
-        g_h = torch.index_select(g_hidden, 0, indices)
-        hidden += g_h
+        if unique:
+            # 從inputs的id取g_hidden的emb
+            indices = []  # 建所有對照的位置, 最後一次tensor select
+            for i in inputs:
+                indices.append((n_idxs==i).nonzero(as_tuple=False)[0][0])  # 紀錄第一個出現的位置
+            indices = torch.tensor(indices).cuda()
+            g_h = torch.index_select(g_hidden, 0, indices)
+        else:
+            g_h = g_hidden
+        # hidden += g_h
         pad = self.embedding(torch.Tensor([0]).to(torch.int64).cuda())
-        return hidden, pad
+        return hidden, pad, g_h
 
 
 def trans_to_cuda(variable):
@@ -191,14 +201,11 @@ def trans_to_cpu(variable):
 
 
 def get(padding_emb, i, hidden, alias_inputs, length):
-    # if torch.any(alias_inputs[i] > hidden[i].shape[0]):
-    #     print(torch.any(alias_inputs[i] > hidden[i].shape[0]))
     # 手動padding
     h_ = hidden[i][alias_inputs[i]]
     if h_.shape[0] == length:
         return h_
     else:
-        # todo 用 torch加速
         r_ = padding_emb.repeat(length - h_.shape[0], 1)
         return torch.cat([h_, r_])
 
@@ -207,7 +214,6 @@ def forward(model, i, data):
     # 改成用 geometric的Data格式
     items, targets, mask, batch, seq = data.x, data.y, data.sequence_mask, data.batch, data.sequence
     seq = seq.view(targets.shape[0], -1)
-    # seq_len = data.sequence_len
     mask = mask.view(targets.shape[0], -1)
 
     A = []
@@ -222,12 +228,14 @@ def forward(model, i, data):
     gg_edge_index = gg.edge_index
     # 直接對 batch下所有node做NeighborSample
     batch_nodes = seq.flatten()
-    batch_nodes = torch.unique(batch_nodes)
-    batch_nodes = batch_nodes[batch_nodes!=0]  # 移除padding node id
+    # batch_nodes = torch.unique(batch_nodes)  # 取unique node in batch sessions
+    # batch_nodes = batch_nodes[batch_nodes!=0]  # 移除padding node id
     # sample as whole batch, 從大graph中找session graph內的node id的鄰居
-    subgraph_loaders = NeighborSampler(gg_edge_index, node_idx=batch_nodes, sizes=[-1], shuffle=False, num_workers=0, batch_size=batch_nodes.shape[0])
+    # subgraph_loaders = NeighborSampler(gg_edge_index, node_idx=batch_nodes, sizes=[-1], shuffle=False, num_workers=0, batch_size=batch_nodes.shape[0])  # all neighbors
+    # fixme 放全部node
+    subgraph_loaders = NeighborSampler(gg_edge_index, node_idx=batch_nodes, sizes=[10, 5], shuffle=False, num_workers=0, batch_size=batch_nodes.shape[0])  # 2 hop
 
-    hidden, pad = model(items, A, data.edge_index, subgraph_loaders)  # session graph node embeddings
+    hidden, pad, g_h = model(items, A, data.edge_index, subgraph_loaders)  # session graph node embeddings
     # 推回原始序列
     sections = torch.bincount(batch).cpu().numpy()
     # split whole x back into graphs G_i
@@ -236,30 +244,15 @@ def forward(model, i, data):
     # todo 增加不考慮padding的選項
     mask_true = True
     if mask_true:
-        # todo 直接在 tensor上做來加速 or 在前處理做好
-        # x = torch.split(items, tuple(sections))
-        # # x是unique nodes, sequence是原始序列
-        # alias_inputs = []
-        # seq = seq.cpu().numpy()
-        # seq_len = seq_len.cpu().numpy()
-        # for i in range(targets.shape[0]):
-        #     x_ = x[i].cpu().numpy().reshape(-1)
-        #     len_ = seq_len[i]
-        #     seq_ = seq[i, :len_]  # 取不是padding的部分
-        #     alias_inputs.append([np.where(x_ == j)[0][0] for j in seq_])
-
-        leng = mask.shape[1]
+        leng = mask.shape[1]  # padding完的session長度
         alias_inputs = data.alias_inputs
         s_len = data.sequence_len.cpu().numpy().tolist()
         alias_inputs = torch.split(alias_inputs, s_len)
-        # alias_inputs2 = data.alias_inputs
-        # alias_inputs2 = torch.split(alias_inputs2, s_len)
-        # alias_inputs2 = [i.cpu().numpy().tolist() for i in list(alias_inputs2)]
-        # compare_ = [alias_inputs[i]==alias_inputs2[i] for i in range(len(alias_inputs))]
-        # print(all([alias_inputs[i]==alias_inputs2[i] for i in range(len(alias_inputs))]))
         seq_hidden = torch.stack([get(pad, i, hidden, alias_inputs, leng) for i in torch.arange(len(alias_inputs)).long()])
+        g_h = g_h.view([len(hidden), leng, -1])
     else:
         seq_hidden = hidden
+    seq_hidden += g_h
     return targets, model.compute_scores(seq_hidden, mask, mask_true)
 
 

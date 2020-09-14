@@ -31,6 +31,7 @@ parser.add_argument('--patience', type=int, default=10, help='the number of epoc
 parser.add_argument('--nonhybrid', action='store_true', help='only use the global preference to predict')
 parser.add_argument('--validation', action='store_true', help='validation')
 parser.add_argument('--valid_portion', type=float, default=0.1, help='split the portion of training set as validation set')
+parser.add_argument('--dynamic', type=bool, default=False, help='using a dataset was created for dynamic graph')
 opt = parser.parse_args()
 print(opt)
 
@@ -43,15 +44,17 @@ logging.basicConfig(level=logging.INFO, filename=log_file, format=FORMAT, datefm
 
 def main():
     cur_dir = os.getcwd()
-    train_dataset = MultiSessionsGraph(cur_dir + '/datasets/' + opt.dataset, phrase='train')
+    train_dataset = MultiSessionsGraph(cur_dir + '/datasets/' + opt.dataset, phrase='train', opt=opt)
     train_loader = DataLoader(train_dataset, batch_size=opt.batchSize, shuffle=True)
-    test_dataset = MultiSessionsGraph(cur_dir + '/datasets/' + opt.dataset, phrase='test')
+    test_dataset = MultiSessionsGraph(cur_dir + '/datasets/' + opt.dataset, phrase='test', opt=opt)
     test_loader = DataLoader(test_dataset, batch_size=opt.batchSize, shuffle=False)
 
     if opt.dataset == 'diginetica':
         n_node = 43040
     elif opt.dataset == 'yoochoose1_64' or opt.dataset == 'yoochoose1_4':
         n_node = 37484
+    elif opt.dataset == 'diginetica_users':
+        n_node = 57070
     else:
         n_node = 310
 
@@ -66,8 +69,8 @@ def main():
         print('epoch: ', epoch)
         logging.info('-------------------------------------------------------')
         logging.info('epoch: %s', epoch)
-        # hit, mrr = train_test(model, train_data, test_data)
         hit, mrr = train_test(model, train_loader, test_loader, logging)
+        # todo add save model
         flag = 0
         if hit >= best_result[0]:
             best_result[0] = hit
